@@ -37,9 +37,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Obse
     private var window: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Regular app (Dock icon) — as an unbundled binary running in accessory
-        // mode, the window/menu-bar item never reached the window server.
-        NSApp.setActivationPolicy(.regular)
+        // Unbundled binaries (swift run) start in prohibited mode and need this
+        // to reach the window server. A proper .app with LSUIElement=true in its
+        // Info.plist handles activation correctly without it (and suppresses the
+        // Dock icon that .regular would otherwise add).
+        if Bundle.main.bundleIdentifier == nil {
+            NSApp.setActivationPolicy(.regular)
+        }
         // The floating window is opt-in — open it from the menu-bar panel.
     }
 
@@ -63,7 +67,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Obse
     }
 
     private func makeWindow() -> NSWindow {
-        let hosting = NSHostingController(rootView: UsagePanelView(model: Self.model, appDelegate: self))
+        let hosting = NSHostingController(rootView: UsagePanelView(model: Self.model, appDelegate: self, isFloating: true)
+            .environment(\.controlActiveState, .active))
         let window = NSWindow(contentViewController: hosting)
         window.title = "Claude Usage"
         window.styleMask = [.titled, .closable, .miniaturizable]

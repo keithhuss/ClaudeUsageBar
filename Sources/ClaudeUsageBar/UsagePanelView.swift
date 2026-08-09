@@ -4,21 +4,24 @@ import AppKit
 struct UsagePanelView: View {
     @ObservedObject var model: UsageModel
     @ObservedObject var appDelegate: AppDelegate
+    var isFloating: Bool = false
     @State private var startAtLogin = LoginItemManager.isEnabled
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Claude Usage")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    appDelegate.toggleFloatingWindow()
-                } label: {
-                    Image(systemName: appDelegate.isWindowVisible ? "macwindow.badge.plus" : "macwindow")
+            if !isFloating {
+                HStack {
+                    Text("Claude Usage")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        appDelegate.toggleFloatingWindow()
+                    } label: {
+                        Image(systemName: appDelegate.isWindowVisible ? "macwindow.badge.plus" : "macwindow")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(appDelegate.isWindowVisible ? "Hide the floating window" : "Show a floating window with these bars")
                 }
-                .buttonStyle(.borderless)
-                .help(appDelegate.isWindowVisible ? "Hide the floating window" : "Show a floating window with these bars")
             }
 
             switch model.status {
@@ -58,22 +61,24 @@ struct UsagePanelView: View {
                     .controlSize(.small)
             }
 
-            Toggle("Start at login", isOn: $startAtLogin)
-                .toggleStyle(.checkbox)
-                .controlSize(.small)
-                .font(.caption)
-                .onChange(of: startAtLogin) { _, enabled in
-                    if enabled {
-                        if !LoginItemManager.enable() {
-                            startAtLogin = false
+            if !isFloating {
+                Toggle("Start at login", isOn: $startAtLogin)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .font(.caption)
+                    .onChange(of: startAtLogin) { _, enabled in
+                        if enabled {
+                            if !LoginItemManager.enable() {
+                                startAtLogin = false
+                            }
+                        } else {
+                            LoginItemManager.disable()
                         }
-                    } else {
-                        LoginItemManager.disable()
                     }
-                }
+            }
         }
         .padding(14)
-        .frame(width: 330)
+        .frame(width: 280)
         .onAppear { model.refresh() }
     }
 
@@ -88,12 +93,13 @@ struct UsagePanelView: View {
                         Text(resetText(bucket.resetsAt))
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                         Text("\(Int(bucket.percent.rounded()))%")
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(bucket.percent >= 90 ? .red : .primary)
+                            .layoutPriority(1)
                     }
-                    ProgressView(value: bucket.percent, total: 100)
-                        .tint(tint(for: bucket.percent))
+                    UsageProgressBar(percent: bucket.percent, color: tint(for: bucket.percent))
                 }
             }
         }
@@ -117,6 +123,25 @@ struct UsagePanelView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "EEE h:mm a"
         return "Resets \(formatter.string(from: date))"
+    }
+
+    // Pure SwiftUI bar — bypasses NSProgressIndicator, which desaturates when the window is inactive.
+    private struct UsageProgressBar: View {
+        let percent: Double
+        let color: Color
+
+        var body: some View {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.primary.opacity(0.1))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(color)
+                        .frame(width: geo.size.width * min(percent / 100, 1))
+                }
+            }
+            .frame(height: 4)
+        }
     }
 
     private func needsLoginView(_ message: String) -> some View {

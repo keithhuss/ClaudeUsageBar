@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 // MARK: - Data types
 
@@ -44,6 +45,7 @@ final class UsageModel: ObservableObject {
     private var credentials: OAuthCredentials?
     private var timer: Timer?
     private var cooldownUntil: Date?          // set after a 429; automatic polls skip until then
+    private var wakeDelayUntil: Date?         // set on system wake; silently skips one poll cycle
     private var lastTokenRefreshAttempt: Date?
 
     /// Claude Code's public OAuth client id, needed for the refresh-token grant.
@@ -51,12 +53,14 @@ final class UsageModel: ObservableObject {
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     private static let tokenURL = URL(string: "https://console.anthropic.com/v1/oauth/token")!
 
+    /// Poll every 5 minutes. The wake-delay on NSWorkspace.didWakeNotification prevents
+    /// maintenance-wake bursts that previously caused overnight rate limiting.
+    private static let pollInterval: TimeInterval = 300
+
     init() {
         refresh()
-        // 5 minutes — polling faster tripped the endpoint's rate limiting overnight.
-        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
+        startRegularTimer()
+        subscribeToWakeNotification()
     }
 
     /// `manual: true` (the Refresh button) bypasses the rate-limit cooldown.
@@ -85,11 +89,43 @@ final class UsageModel: ObservableObject {
         }
     }
 
+    // MARK: Scheduling
+
+    private func startRegularTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+    }
+
+    /// On system wake, delay the first poll by 2 minutes so we don't immediately
+    /// hit the API on a fresh network connection — the direct cause of rate-limit
+    /// errors seen after overnight sleep.
+    private func subscribeToWakeNotification() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleWake() }
+        }
+    }
+
+    private func handleWake() {
+        wakeDelayUntil = Date().addingTimeInterval(120)
+        // Reset the regular timer so the next fire is 15 min from now,
+        // not an indeterminate leftover from before sleep.
+        startRegularTimer()
+    }
+
     // MARK: Core flow
 
     private func reload(manual: Bool) async {
-        // Respect the rate-limit cooldown for automatic polls.
-        if !manual, let cooldownUntil, cooldownUntil > Date() { return }
+        // Respect the wake delay (silent) and rate-limit cooldown for automatic polls.
+        if !manual {
+            if let wakeDelayUntil, wakeDelayUntil > Date() { return }
+            if let cooldownUntil, cooldownUntil > Date() { return }
+        }
 
         // 1. Find the freshest usable credentials (own store or Claude Code's Keychain items).
         guard let found = await Task.detached(operation: { CredentialStore.bestCredentials() }).value else {
@@ -143,6 +179,7 @@ final class UsageModel: ObservableObject {
                 return
             }
             cooldownUntil = nil
+            wakeDelayUntil = nil
             buckets = parsed
             lastUpdated = Date()
             status = .ok
