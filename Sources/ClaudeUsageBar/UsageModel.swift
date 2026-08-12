@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CoreGraphics
 
 // MARK: - Data types
 
@@ -42,20 +43,41 @@ final class UsageModel: ObservableObject {
     @Published var status: Status = .loading
     @Published var lastUpdated: Date?
 
+    /// Manual override for the Fable-usage case — polls at `fastPollInterval` while on.
+    @Published var fastPollingEnabled: Bool = false
+
     private var credentials: OAuthCredentials?
     private var timer: Timer?
     private var cooldownUntil: Date?          // set after a 429; automatic polls skip until then
     private var wakeDelayUntil: Date?         // set on system wake; silently skips one poll cycle
     private var lastTokenRefreshAttempt: Date?
+    private var lastPollAttempt: Date?        // gates automatic polls against currentPollInterval
+    private var consecutive429s: Int = 0      // backs off harder if the server keeps saying no
 
     /// Claude Code's public OAuth client id, needed for the refresh-token grant.
     private static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     private static let tokenURL = URL(string: "https://console.anthropic.com/v1/oauth/token")!
 
-    /// Poll every 5 minutes. The wake-delay on NSWorkspace.didWakeNotification prevents
-    /// maintenance-wake bursts that previously caused overnight rate limiting.
-    private static let pollInterval: TimeInterval = 300
+    /// Actual polling cadence is one of these three, chosen by `currentPollInterval` below.
+    /// A short timer just checks every `tickInterval` whether the chosen interval has
+    /// elapsed since the last attempt — this lets the effective rate change instantly
+    /// (toggling fast mode, or the Mac going idle/active) without recreating the Timer.
+    private static let fastPollInterval: TimeInterval = 300      // Fable mode
+    private static let normalPollInterval: TimeInterval = 900
+    private static let idlePollInterval: TimeInterval = 1800
+    private static let idleThreshold: TimeInterval = 600         // Mac idle this long → slow down
+    private static let tickInterval: TimeInterval = 30
+
+    private var currentPollInterval: TimeInterval {
+        if fastPollingEnabled { return Self.fastPollInterval }
+        if Self.systemIdleSeconds() >= Self.idleThreshold { return Self.idlePollInterval }
+        return Self.normalPollInterval
+    }
+
+    private static func systemIdleSeconds() -> TimeInterval {
+        CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .null)
+    }
 
     init() {
         refresh()
@@ -93,14 +115,14 @@ final class UsageModel: ObservableObject {
 
     private func startRegularTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
 
-    /// On system wake, delay the first poll by 2 minutes so we don't immediately
-    /// hit the API on a fresh network connection — the direct cause of rate-limit
-    /// errors seen after overnight sleep.
+    /// On system wake, delay the first poll by 5 minutes so we don't immediately
+    /// hit the API on a fresh network connection — Claude Code itself also polls
+    /// the usage endpoint and together they can exceed Anthropic's burst limit.
     private func subscribeToWakeNotification() {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
@@ -112,20 +134,22 @@ final class UsageModel: ObservableObject {
     }
 
     private func handleWake() {
-        wakeDelayUntil = Date().addingTimeInterval(120)
-        // Reset the regular timer so the next fire is 15 min from now,
-        // not an indeterminate leftover from before sleep.
-        startRegularTimer()
+        wakeDelayUntil = Date().addingTimeInterval(300)
     }
 
     // MARK: Core flow
 
     private func reload(manual: Bool) async {
-        // Respect the wake delay (silent) and rate-limit cooldown for automatic polls.
+        // Respect the wake delay (silent), rate-limit cooldown, and normal polling
+        // cadence for automatic polls — the tick timer fires far more often than we
+        // actually want to hit the network.
         if !manual {
-            if let wakeDelayUntil, wakeDelayUntil > Date() { return }
-            if let cooldownUntil, cooldownUntil > Date() { return }
+            let now = Date()
+            if let wakeDelayUntil, wakeDelayUntil > now { return }
+            if let cooldownUntil, cooldownUntil > now { return }
+            if let lastPollAttempt, now.timeIntervalSince(lastPollAttempt) < currentPollInterval { return }
         }
+        lastPollAttempt = Date()
 
         // 1. Find the freshest usable credentials (own store or Claude Code's Keychain items).
         guard let found = await Task.detached(operation: { CredentialStore.bestCredentials() }).value else {
@@ -164,7 +188,12 @@ final class UsageModel: ObservableObject {
                 if code == 401 {
                     status = .needsLogin("Token expired and couldn't be refreshed.")
                 } else if code == 429 {
-                    let wait = max(retryAfter ?? 900, 300)
+                    // Back off harder on repeated 429s — resuming at full cadence right when a
+                    // single cooldown expires can retrigger the limit if its window hasn't really
+                    // cleared, turning one hiccup into a cascading multi-hour lockout.
+                    consecutive429s += 1
+                    let base = max(retryAfter ?? 900, 300)
+                    let wait = base * pow(2.0, Double(min(consecutive429s - 1, 4)))
                     let until = Date().addingTimeInterval(wait)
                     cooldownUntil = until
                     status = .error("Rate limited — retrying at \(until.formatted(date: .omitted, time: .shortened))")
@@ -180,6 +209,7 @@ final class UsageModel: ObservableObject {
             }
             cooldownUntil = nil
             wakeDelayUntil = nil
+            consecutive429s = 0
             buckets = parsed
             lastUpdated = Date()
             status = .ok

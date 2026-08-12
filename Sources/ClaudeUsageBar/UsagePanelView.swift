@@ -62,6 +62,12 @@ struct UsagePanelView: View {
             }
 
             if !isFloating {
+                Toggle("Fast polling (Fable mode)", isOn: $model.fastPollingEnabled)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .font(.caption)
+                    .help("Poll every 5 minutes instead of the normal cadence — turn on while actively using Fable.")
+
                 Toggle("Start at login", isOn: $startAtLogin)
                     .toggleStyle(.checkbox)
                     .controlSize(.small)

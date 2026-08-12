@@ -10,7 +10,9 @@ panel with all the bars, reset times, and controls:
 - **Window button (header):** shows/hides an optional floating window with the same
   bars — always on top (even over Xcode), draggable, remembers its position. Closing
   the window keeps the app running; clicking the Dock icon reopens it.
-- **Refresh:** immediate fetch (bypasses the rate-limit cooldown).
+- **Refresh:** immediate fetch (bypasses the rate-limit cooldown and the poll-interval throttle).
+- **Fast polling (Fable mode):** tick the box before a Fable session to poll every 5
+  minutes instead of the normal cadence; untick when done.
 - **Quit:** the only way the app exits.
 - **Start at login:** installs a LaunchAgent (`com.keith.ClaudeUsageBar`) that runs a
   copy of the binary from `~/Library/Application Support/ClaudeUsageBar/` at every
@@ -50,11 +52,26 @@ ClaudeUsageBar in Bartender's hidden items and set it to Always Show.
 
 ## Polling & rate limits
 
-- Polls every **5 minutes**, plus whenever the panel opens or Refresh is clicked.
-  (Polling every minute got the account rate-limited overnight — don't lower this.)
-- On a 429 the app backs off (honors `retry-after`, minimum 5 minutes) and shows
-  "Rate limited — retrying at …". It recovers automatically.
+The `api/oauth/usage` rate-limit bucket appears to be shared across every client using
+your OAuth token (Claude Code CLI, this app, etc.), so polling too aggressively — even
+from a single app — can trip it. Polling cadence adapts instead of staying fixed:
+
+- **Fast (5 min):** while "Fast polling (Fable mode)" is checked.
+- **Normal (15 min):** default, whenever the Mac is actively in use.
+- **Idle (30 min):** automatic, once the Mac has been idle 10+ minutes (checked via
+  `CGEventSource.secondsSinceLastEventType`, no permissions needed). Any input resumes
+  normal cadence on the next check.
+- A lightweight 30-second tick timer just checks whether the current interval has
+  elapsed since the last attempt — so a mode change (toggling Fable mode, or the Mac
+  going idle/active) takes effect on the next tick rather than waiting for a stale timer.
+- On system wake, polling is silently delayed 5 minutes so the app doesn't hit a fresh
+  network connection right when Claude Code itself may also be re-polling.
+- On a 429 the app backs off (honors `retry-after`, minimum 5 minutes) and doubles the
+  wait on each consecutive 429 (capped at 16×) so one hiccup can't cascade into a
+  multi-hour lockout from retrying at full speed the moment each cooldown expires. The
+  backoff resets on the next success. Shows "Rate limited — retrying at …" meanwhile.
 - OAuth token refreshes are attempted at most once per 10 minutes.
+- Refresh (the button) always bypasses every throttle above.
 
 ## Notes / caveats
 
