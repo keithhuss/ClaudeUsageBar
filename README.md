@@ -32,8 +32,9 @@ logged in once:
    curl -fsSL https://claude.ai/install.sh | bash
    ```
 2. Run `claude`, log in with your Claude account when the browser opens, then quit it.
-3. Done — you never need to run the CLI again. The app copies the token into its own
-   Keychain item (`ClaudeUsageBar-credentials`) and refreshes it itself from then on.
+3. Done. The app reads Claude Code's own Keychain item and, when it refreshes the
+   token, writes the result back to that same item — see **Token handling** below for
+   why it doesn't fork a private copy.
 
 ## Running
 
@@ -80,6 +81,18 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
   session / weekly_all / weekly_scoped entries — with a fallback for the older
   top-level bucket shape. A breaking change there would need a small code update.
 - **Token handling.** Access tokens expire every few hours; the app refreshes them with
-  the stored refresh token (Claude Code's public OAuth client id) and keeps its copy in
-  its own Keychain item so it never overwrites Claude Code's. If the panel ever shows
-  "token expired," running `claude` once in Terminal re-seeds it.
+  the stored refresh token (Claude Code's public OAuth client id). Refresh tokens are
+  single-use/rotating, so refreshes are written back to whichever Keychain item
+  (almost always Claude Code CLI's own — `Claude Code-credentials`, possibly with a
+  config-dir suffix for the Xcode integration) the credential was read from, rather
+  than forked into a private item. An earlier version *did* fork a private copy that
+  refreshed independently of the CLI — since both sides were consuming the same
+  single-use rotating token from two unsynced copies, whichever side refreshed first
+  invalidated the other's, causing "Token expired and couldn't be refreshed" any time
+  the CLI was used heavily (fixed 2026-08-13). The write is a merge, not a replace —
+  Claude Code's real items carry extra fields this app doesn't model
+  (`refreshTokenExpiresAt`, `subscriptionType`, `rateLimitTier`, `clientId`), so only
+  the changed fields (`accessToken`, `refreshToken`, `expiresAt`) are updated in place;
+  everything else in the JSON blob passes through untouched. If the panel ever shows
+  "token expired," running `claude` once in Terminal re-seeds it — this is a fresh
+  OAuth login, not a repair, so it works even if the stored token is fully dead.

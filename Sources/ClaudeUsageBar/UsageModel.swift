@@ -152,23 +152,30 @@ final class UsageModel: ObservableObject {
         lastPollAttempt = Date()
 
         // 1. Find the freshest usable credentials (own store or Claude Code's Keychain items).
-        guard let found = await Task.detached(operation: { CredentialStore.bestCredentials() }).value else {
+        guard let found = await Task.detached(operation: { CredentialStore.bestFound() }).value else {
             status = .needsLogin("No Claude Code login found on this Mac.")
             return
         }
-        guard found.hasProfileScope else {
+        guard found.credentials.hasProfileScope else {
             status = .needsLogin("Only the Xcode integration's token was found — it can't read usage data.")
             return
         }
 
+        // Refreshes are written back to whichever Keychain item the credential came from
+        // (almost always Claude Code CLI's own item, not a private copy). Anthropic's refresh
+        // tokens are single-use/rotating — forking a private copy that refreshes independently
+        // of the CLI meant whichever side refreshed first invalidated the other's copy, causing
+        // "Token expired and couldn't be refreshed" every time the CLI was used heavily.
+        let service = found.service
+
         // 2. Proactively refresh if the access token is about to expire —
         //    at most once per 10 minutes, so a failing refresh can't hammer the endpoint.
-        var current = found
+        var current = found.credentials
         if current.isExpiringSoon, mayAttemptTokenRefresh() {
             lastTokenRefreshAttempt = Date()
             if let refreshed = await Self.refreshAccessToken(current) {
                 current = refreshed
-                await Task.detached(operation: { CredentialStore.writeOwn(refreshed) }).value
+                await Task.detached(operation: { CredentialStore.write(service: service, rawData: found.rawData, refreshed: refreshed) }).value
             }
         }
         credentials = current
@@ -180,7 +187,7 @@ final class UsageModel: ObservableObject {
                 lastTokenRefreshAttempt = Date()
                 if let refreshed = await Self.refreshAccessToken(current) {
                     credentials = refreshed
-                    await Task.detached(operation: { CredentialStore.writeOwn(refreshed) }).value
+                    await Task.detached(operation: { CredentialStore.write(service: service, rawData: found.rawData, refreshed: refreshed) }).value
                     (code, data, retryAfter) = try await Self.fetchUsage(token: refreshed.accessToken)
                 }
             }
@@ -364,25 +371,32 @@ final class UsageModel: ObservableObject {
 // MARK: - Keychain access (via /usr/bin/security)
 
 enum CredentialStore {
-    /// The app's own Keychain item, so refreshed tokens don't overwrite Claude Code's.
+    /// Legacy private item from before refreshes were written back to Claude Code's own
+    /// item — still read (in case it's somehow the freshest) but never written to anymore.
     static let ownService = "ClaudeUsageBar-credentials"
+
+    struct Found {
+        let service: String
+        let credentials: OAuthCredentials
+        let rawData: Data   // exact bytes read from Keychain, so write(service:) can preserve unknown fields
+    }
 
     /// Picks the credentials with the latest expiry, preferring ones with the user:profile scope
     /// (the Xcode integration's token lacks it and can't read usage data).
-    static func bestCredentials() -> OAuthCredentials? {
-        var candidates: [OAuthCredentials] = []
+    static func bestFound() -> Found? {
+        var candidates: [Found] = []
         if let own = read(service: ownService) {
             candidates.append(own)
         }
         for name in claudeCodeServiceNames() {
-            if let creds = read(service: name) {
-                candidates.append(creds)
+            if let found = read(service: name) {
+                candidates.append(found)
             }
         }
         guard !candidates.isEmpty else { return nil }
-        let profiled = candidates.filter { $0.hasProfileScope }
+        let profiled = candidates.filter { $0.credentials.hasProfileScope }
         let pool = profiled.isEmpty ? candidates : profiled
-        return pool.max { ($0.expiresAt ?? 0) < ($1.expiresAt ?? 0) }
+        return pool.max { ($0.credentials.expiresAt ?? 0) < ($1.credentials.expiresAt ?? 0) }
     }
 
     /// Claude Code may store its item as "Claude Code-credentials" or with a config-dir suffix
@@ -403,7 +417,7 @@ enum CredentialStore {
         return names.sorted()
     }
 
-    static func read(service: String) -> OAuthCredentials? {
+    static func read(service: String) -> Found? {
         let result = run("/usr/bin/security", ["find-generic-password", "-s", service, "-w"])
         guard result.status == 0, let data = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8) else {
             return nil
@@ -412,17 +426,39 @@ enum CredentialStore {
         // Claude Code wraps the payload in {"claudeAiOauth": {...}}; our own item stores it bare.
         struct Wrapper: Codable { let claudeAiOauth: OAuthCredentials? }
         if let wrapped = try? decoder.decode(Wrapper.self, from: data), let creds = wrapped.claudeAiOauth {
-            return creds
+            return Found(service: service, credentials: creds, rawData: data)
         }
-        return try? decoder.decode(OAuthCredentials.self, from: data)
+        if let creds = try? decoder.decode(OAuthCredentials.self, from: data) {
+            return Found(service: service, credentials: creds, rawData: data)
+        }
+        return nil
     }
 
-    static func writeOwn(_ creds: OAuthCredentials) {
-        guard let data = try? JSONEncoder().encode(creds),
-              let json = String(data: data, encoding: .utf8)
+    /// Writes back to whichever service the credential was read from. Claude Code's real items
+    /// carry extra fields we don't model (refreshTokenExpiresAt, subscriptionType, rateLimitTier,
+    /// clientId) — re-encoding a bare OAuthCredentials would silently drop them and corrupt
+    /// Claude Code CLI's own session, so this merges only the changed fields into the ORIGINAL
+    /// JSON read from this service instead of replacing the object wholesale.
+    static func write(service: String, rawData: Data, refreshed: OAuthCredentials) {
+        guard var top = (try? JSONSerialization.jsonObject(with: rawData)) as? [String: Any] else { return }
+        let isWrapped = service != ownService
+        var inner = isWrapped ? (top["claudeAiOauth"] as? [String: Any] ?? [:]) : top
+
+        inner["accessToken"] = refreshed.accessToken
+        if let refreshToken = refreshed.refreshToken { inner["refreshToken"] = refreshToken }
+        if let expiresAt = refreshed.expiresAt { inner["expiresAt"] = expiresAt }
+
+        if isWrapped {
+            top["claudeAiOauth"] = inner
+        } else {
+            top = inner
+        }
+
+        guard let payload = try? JSONSerialization.data(withJSONObject: top),
+              let json = String(data: payload, encoding: .utf8)
         else { return }
         // -U updates the item in place if it already exists.
-        run("/usr/bin/security", ["add-generic-password", "-U", "-s", ownService, "-a", NSUserName(), "-w", json])
+        run("/usr/bin/security", ["add-generic-password", "-U", "-s", service, "-a", NSUserName(), "-w", json])
     }
 
     @discardableResult
