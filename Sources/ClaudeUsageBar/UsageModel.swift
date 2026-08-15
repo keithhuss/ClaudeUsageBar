@@ -53,6 +53,7 @@ final class UsageModel: ObservableObject {
     private var lastTokenRefreshAttempt: Date?
     private var lastPollAttempt: Date?        // gates automatic polls against currentPollInterval
     private var consecutive429s: Int = 0      // backs off harder if the server keeps saying no
+    private var authFailureSince: Date?       // first 401-with-failed-refresh; cleared on success
 
     /// Claude Code's public OAuth client id, needed for the refresh-token grant.
     private static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -69,7 +70,17 @@ final class UsageModel: ObservableObject {
     private static let idleThreshold: TimeInterval = 600         // Mac idle this long → slow down
     private static let tickInterval: TimeInterval = 30
 
+    /// Most 401s turn out to be transient (a flaky refresh call, a momentary server hiccup) and
+    /// clear up on their own — retry quickly and quietly rather than immediately telling the user
+    /// they need to redo the one-time setup. Only escalate to needsLogin once failures persist
+    /// past this grace period.
+    private static let authRetryInterval: TimeInterval = 90
+    private static let authRetryGracePeriod: TimeInterval = 1200
+
     private var currentPollInterval: TimeInterval {
+        if let authFailureSince, Date().timeIntervalSince(authFailureSince) < Self.authRetryGracePeriod {
+            return Self.authRetryInterval
+        }
         if fastPollingEnabled { return Self.fastPollInterval }
         if Self.systemIdleSeconds() >= Self.idleThreshold { return Self.idlePollInterval }
         return Self.normalPollInterval
@@ -193,7 +204,13 @@ final class UsageModel: ObservableObject {
             }
             guard code == 200 else {
                 if code == 401 {
-                    status = .needsLogin("Token expired and couldn't be refreshed.")
+                    let failingSince = authFailureSince ?? Date()
+                    authFailureSince = failingSince
+                    if Date().timeIntervalSince(failingSince) < Self.authRetryGracePeriod {
+                        status = .error("Reconnecting…")
+                    } else {
+                        status = .needsLogin("Token expired and couldn't be refreshed.")
+                    }
                 } else if code == 429 {
                     // Back off harder on repeated 429s — resuming at full cadence right when a
                     // single cooldown expires can retrigger the limit if its window hasn't really
@@ -217,6 +234,7 @@ final class UsageModel: ObservableObject {
             cooldownUntil = nil
             wakeDelayUntil = nil
             consecutive429s = 0
+            authFailureSince = nil
             buckets = parsed
             lastUpdated = Date()
             status = .ok

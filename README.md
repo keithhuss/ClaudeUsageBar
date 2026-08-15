@@ -71,7 +71,14 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
   wait on each consecutive 429 (capped at 16×) so one hiccup can't cascade into a
   multi-hour lockout from retrying at full speed the moment each cooldown expires. The
   backoff resets on the next success. Shows "Rate limited — retrying at …" meanwhile.
-- OAuth token refreshes are attempted at most once per 10 minutes.
+- OAuth token refreshes are attempted at most once per 10 minutes (except the fast
+  auth-failure retry below, which isn't subject to this).
+- On a 401 whose refresh attempt fails, the app doesn't immediately assume the token
+  is dead — most such failures turn out to be transient (a flaky refresh call, a
+  momentary server hiccup) and clear up within a poll or two. It retries every 90
+  seconds, showing "Reconnecting…" with the last-known bars still visible, for up to 20
+  minutes before escalating to the "token expired" setup screen. The 20-minute clock
+  resets on any success.
 - Refresh (the button) always bypasses every throttle above.
 
 ## Notes / caveats
