@@ -65,8 +65,13 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
 - A lightweight 30-second tick timer just checks whether the current interval has
   elapsed since the last attempt — so a mode change (toggling Fable mode, or the Mac
   going idle/active) takes effect on the next tick rather than waiting for a stale timer.
-- On system wake, polling is silently delayed 5 minutes so the app doesn't hit a fresh
-  network connection right when Claude Code itself may also be re-polling.
+- On system wake, polling is silently held off until `NWPathMonitor` confirms the network
+  has been continuously reachable for 20 seconds — not a fixed timer — capped at 10
+  minutes so a monitor glitch can't wedge polling forever. This matters because this app
+  is typically the *only* client that ever refreshes its Keychain credential; refresh
+  tokens are single-use, so a refresh attempted on a not-yet-stable connection can have
+  its response lost after the server already rotated the token, killing it permanently
+  with nothing else around to recover it. See **Token handling** below.
 - On a 429 the app backs off (honors `retry-after`, minimum 5 minutes) and doubles the
   wait on each consecutive 429 (capped at 16×) so one hiccup can't cascade into a
   multi-hour lockout from retrying at full speed the moment each cooldown expires. The
@@ -103,3 +108,7 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
   everything else in the JSON blob passes through untouched. If the panel ever shows
   "token expired," running `claude` once in Terminal re-seeds it — this is a fresh
   OAuth login, not a repair, so it works even if the stored token is fully dead.
+- **If Keith never runs the CLI himself** (confirmed 2026-08-17), this app is the *sole*
+  client touching that Keychain item — there's no other client to collide with it, so a
+  dead token traces back to this app's own refresh call losing a race against a flaky
+  network (see the wake-gating note above), not a collision with anything else.

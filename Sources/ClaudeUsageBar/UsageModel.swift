@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CoreGraphics
+import Network
 
 // MARK: - Data types
 
@@ -49,11 +50,22 @@ final class UsageModel: ObservableObject {
     private var credentials: OAuthCredentials?
     private var timer: Timer?
     private var cooldownUntil: Date?          // set after a 429; automatic polls skip until then
-    private var wakeDelayUntil: Date?         // set on system wake; silently skips one poll cycle
     private var lastTokenRefreshAttempt: Date?
     private var lastPollAttempt: Date?        // gates automatic polls against currentPollInterval
     private var consecutive429s: Int = 0      // backs off harder if the server keeps saying no
     private var authFailureSince: Date?       // first 401-with-failed-refresh; cleared on success
+
+    // Since this app is the only client that ever refreshes its Keychain credential (Keith
+    // doesn't run Claude Code CLI directly), a refresh attempt that starts before the network
+    // has actually stabilized post-wake risks the single-use refresh token being rotated
+    // server-side while the response carrying the new one is lost — permanently killing it
+    // with nothing else around to recover it. Wait for confirmed-stable connectivity instead
+    // of guessing with a fixed timer.
+    private var pathMonitor: NWPathMonitor?
+    private var networkSatisfiedSince: Date?
+    private var wakePending: Date?
+    private static let requiredStableNetworkDuration: TimeInterval = 20
+    private static let maxWakeNetworkWait: TimeInterval = 600     // give up waiting and try anyway
 
     /// Claude Code's public OAuth client id, needed for the refresh-token grant.
     private static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -94,6 +106,7 @@ final class UsageModel: ObservableObject {
         refresh()
         startRegularTimer()
         subscribeToWakeNotification()
+        startNetworkMonitor()
     }
 
     /// `manual: true` (the Refresh button) bypasses the rate-limit cooldown.
@@ -131,9 +144,8 @@ final class UsageModel: ObservableObject {
         }
     }
 
-    /// On system wake, delay the first poll by 5 minutes so we don't immediately
-    /// hit the API on a fresh network connection — Claude Code itself also polls
-    /// the usage endpoint and together they can exceed Anthropic's burst limit.
+    /// On system wake, hold off polling until the network has been confirmed stable for a
+    /// while (see `isAwaitingStableNetwork`) rather than guessing with a fixed delay.
     private func subscribeToWakeNotification() {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
@@ -145,21 +157,50 @@ final class UsageModel: ObservableObject {
     }
 
     private func handleWake() {
-        wakeDelayUntil = Date().addingTimeInterval(300)
+        wakePending = Date()
+    }
+
+    private func startNetworkMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor in self?.handleNetworkPathUpdate(satisfied: satisfied) }
+        }
+        monitor.start(queue: DispatchQueue(label: "ClaudeUsageBar.NWPathMonitor"))
+        pathMonitor = monitor
+    }
+
+    private func handleNetworkPathUpdate(satisfied: Bool) {
+        if satisfied {
+            if networkSatisfiedSince == nil { networkSatisfiedSince = Date() }
+        } else {
+            networkSatisfiedSince = nil
+        }
+    }
+
+    /// True while we should keep silently skipping automatic polls after a wake: either the
+    /// network hasn't been continuously reachable for `requiredStableNetworkDuration` yet, or
+    /// we don't have positive confirmation of connectivity at all. Gives up and proceeds anyway
+    /// past `maxWakeNetworkWait` so a monitor glitch can't wedge polling forever.
+    private func isAwaitingStableNetwork(since wokeAt: Date, now: Date) -> Bool {
+        if now.timeIntervalSince(wokeAt) >= Self.maxWakeNetworkWait { return false }
+        guard let networkSatisfiedSince else { return true }
+        return now.timeIntervalSince(networkSatisfiedSince) < Self.requiredStableNetworkDuration
     }
 
     // MARK: Core flow
 
     private func reload(manual: Bool) async {
-        // Respect the wake delay (silent), rate-limit cooldown, and normal polling
-        // cadence for automatic polls — the tick timer fires far more often than we
-        // actually want to hit the network.
+        // Respect the post-wake network-stability wait (silent), rate-limit cooldown, and
+        // normal polling cadence for automatic polls — the tick timer fires far more often
+        // than we actually want to hit the network.
         if !manual {
             let now = Date()
-            if let wakeDelayUntil, wakeDelayUntil > now { return }
+            if let wakePending, isAwaitingStableNetwork(since: wakePending, now: now) { return }
             if let cooldownUntil, cooldownUntil > now { return }
             if let lastPollAttempt, now.timeIntervalSince(lastPollAttempt) < currentPollInterval { return }
         }
+        wakePending = nil
         lastPollAttempt = Date()
 
         // 1. Find the freshest usable credentials (own store or Claude Code's Keychain items).
@@ -232,7 +273,6 @@ final class UsageModel: ObservableObject {
                 return
             }
             cooldownUntil = nil
-            wakeDelayUntil = nil
             consecutive429s = 0
             authFailureSince = nil
             buckets = parsed
