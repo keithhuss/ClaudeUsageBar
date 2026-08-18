@@ -83,8 +83,14 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
   momentary server hiccup) and clear up within a poll or two. It retries every 90
   seconds, showing "Reconnecting…" with the last-known bars still visible, for up to 20
   minutes before escalating to the "token expired" setup screen. The 20-minute clock
-  resets on any success.
-- Refresh (the button) always bypasses every throttle above.
+  resets on any success, and also resets if a *different* kind of failure (a 429, or a
+  network exception) happens in between — otherwise a stale clock from an
+  already-resolved incident could make a later, unrelated 401 escalate immediately
+  instead of getting its own fresh 20 minutes. The 429 backoff multiplier has the same
+  reset-on-a-different-failure-type behavior.
+- Refresh (the button) always bypasses every throttle above, but never runs concurrently
+  with an already-in-flight reload (automatic or manual) — otherwise both could read and
+  try to refresh the same single-use refresh token, guaranteeing one of them fails.
 
 ## Notes / caveats
 
@@ -111,4 +117,8 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
 - **If Keith never runs the CLI himself** (confirmed 2026-08-17), this app is the *sole*
   client touching that Keychain item — there's no other client to collide with it, so a
   dead token traces back to this app's own refresh call losing a race against a flaky
-  network (see the wake-gating note above), not a collision with anything else.
+  network (see the wake-gating note above), or against *itself* (fixed 2026-08-17 — see
+  Polling & rate limits above), not a collision with anything else.
+- The legacy private `ClaudeUsageBar-credentials` item from before the 2026-08-13 fix is
+  no longer read at all (removed 2026-08-17) — nothing has written to it since, so it
+  could never again be the freshest candidate; reading it every poll was pointless.

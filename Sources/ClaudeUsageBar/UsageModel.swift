@@ -55,6 +55,12 @@ final class UsageModel: ObservableObject {
     private var consecutive429s: Int = 0      // backs off harder if the server keeps saying no
     private var authFailureSince: Date?       // first 401-with-failed-refresh; cleared on success
 
+    // A manual Refresh click bypasses the throttles below, so without this a click made
+    // while an automatic poll is already mid-flight (e.g. during the auth-retry grace
+    // period) could start a second, fully independent reload — both reading and possibly
+    // both trying to refresh the same single-use refresh token, guaranteeing one fails.
+    private var isReloading = false
+
     // Since this app is the only client that ever refreshes its Keychain credential (Keith
     // doesn't run Claude Code CLI directly), a refresh attempt that starts before the network
     // has actually stabilized post-wake risks the single-use refresh token being rotated
@@ -191,6 +197,12 @@ final class UsageModel: ObservableObject {
     // MARK: Core flow
 
     private func reload(manual: Bool) async {
+        // Never let two reloads run concurrently — a manual click while an automatic one is
+        // already in flight would otherwise race it (see isReloading's doc comment above).
+        guard !isReloading else { return }
+        isReloading = true
+        defer { isReloading = false }
+
         // Respect the post-wake network-stability wait (silent), rate-limit cooldown, and
         // normal polling cadence for automatic polls — the tick timer fires far more often
         // than we actually want to hit the network.
@@ -244,7 +256,13 @@ final class UsageModel: ObservableObject {
                 }
             }
             guard code == 200 else {
+                // Each counter below only accumulates across consecutive occurrences of its
+                // own failure type — reset on the others so a stale timer/count from an
+                // already-resolved incident can't distort how a later, unrelated failure is
+                // handled (e.g. a 429 in between two 401s shouldn't shorten the grace period
+                // the second 401 gets, and vice versa).
                 if code == 401 {
+                    consecutive429s = 0
                     let failingSince = authFailureSince ?? Date()
                     authFailureSince = failingSince
                     if Date().timeIntervalSince(failingSince) < Self.authRetryGracePeriod {
@@ -256,6 +274,7 @@ final class UsageModel: ObservableObject {
                     // Back off harder on repeated 429s — resuming at full cadence right when a
                     // single cooldown expires can retrigger the limit if its window hasn't really
                     // cleared, turning one hiccup into a cascading multi-hour lockout.
+                    authFailureSince = nil
                     consecutive429s += 1
                     let base = max(retryAfter ?? 900, 300)
                     let wait = base * pow(2.0, Double(min(consecutive429s - 1, 4)))
@@ -263,6 +282,8 @@ final class UsageModel: ObservableObject {
                     cooldownUntil = until
                     status = .error("Rate limited — retrying at \(until.formatted(date: .omitted, time: .shortened))")
                 } else {
+                    authFailureSince = nil
+                    consecutive429s = 0
                     status = .error(Self.apiErrorMessage(from: data) ?? "HTTP \(code)")
                 }
                 return
@@ -279,6 +300,8 @@ final class UsageModel: ObservableObject {
             lastUpdated = Date()
             status = .ok
         } catch {
+            authFailureSince = nil
+            consecutive429s = 0
             status = .error(error.localizedDescription)
         }
     }
@@ -313,22 +336,35 @@ final class UsageModel: ObservableObject {
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let accessToken = json["access_token"] as? String
-        else { return nil }
+        // A network-layer failure (timeout, connection lost — data(for:) throws) means the
+        // request most likely never reached the server, so the single-use refresh token
+        // wasn't consumed and it's safe to retry with the same one. An actual HTTP response,
+        // even a non-200 one, means the server saw the request — no such guarantee there, so
+        // that case returns immediately rather than retrying. This app is typically the only
+        // client that ever refreshes this credential, so losing this race even once leaves
+        // nothing else around to recover it.
+        for attempt in 0..<3 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+            guard let (data, response) = try? await URLSession.shared.data(for: request) else {
+                continue
+            }
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let accessToken = json["access_token"] as? String
+            else { return nil }
 
-        var updated = creds
-        updated.accessToken = accessToken
-        if let newRefresh = json["refresh_token"] as? String {
-            updated.refreshToken = newRefresh
+            var updated = creds
+            updated.accessToken = accessToken
+            if let newRefresh = json["refresh_token"] as? String {
+                updated.refreshToken = newRefresh
+            }
+            // Without this default, a response missing expires_in would leave the old
+            // (past) expiry in place, making every poll re-attempt a refresh.
+            let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 3600
+            updated.expiresAt = (Date().timeIntervalSince1970 + expiresIn) * 1000
+            return updated
         }
-        // Without this default, a response missing expires_in would leave the old
-        // (past) expiry in place, making every poll re-attempt a refresh.
-        let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 3600
-        updated.expiresAt = (Date().timeIntervalSince1970 + expiresIn) * 1000
-        return updated
+        return nil
     }
 
     // MARK: Parsing
@@ -429,10 +465,6 @@ final class UsageModel: ObservableObject {
 // MARK: - Keychain access (via /usr/bin/security)
 
 enum CredentialStore {
-    /// Legacy private item from before refreshes were written back to Claude Code's own
-    /// item — still read (in case it's somehow the freshest) but never written to anymore.
-    static let ownService = "ClaudeUsageBar-credentials"
-
     struct Found {
         let service: String
         let credentials: OAuthCredentials
@@ -443,9 +475,6 @@ enum CredentialStore {
     /// (the Xcode integration's token lacks it and can't read usage data).
     static func bestFound() -> Found? {
         var candidates: [Found] = []
-        if let own = read(service: ownService) {
-            candidates.append(own)
-        }
         for name in claudeCodeServiceNames() {
             if let found = read(service: name) {
                 candidates.append(found)
@@ -499,18 +528,13 @@ enum CredentialStore {
     /// JSON read from this service instead of replacing the object wholesale.
     static func write(service: String, rawData: Data, refreshed: OAuthCredentials) {
         guard var top = (try? JSONSerialization.jsonObject(with: rawData)) as? [String: Any] else { return }
-        let isWrapped = service != ownService
-        var inner = isWrapped ? (top["claudeAiOauth"] as? [String: Any] ?? [:]) : top
+        var inner = top["claudeAiOauth"] as? [String: Any] ?? [:]
 
         inner["accessToken"] = refreshed.accessToken
         if let refreshToken = refreshed.refreshToken { inner["refreshToken"] = refreshToken }
         if let expiresAt = refreshed.expiresAt { inner["expiresAt"] = expiresAt }
 
-        if isWrapped {
-            top["claudeAiOauth"] = inner
-        } else {
-            top = inner
-        }
+        top["claudeAiOauth"] = inner
 
         guard let payload = try? JSONSerialization.data(withJSONObject: top),
               let json = String(data: payload, encoding: .utf8)
