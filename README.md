@@ -57,6 +57,12 @@ The `api/oauth/usage` rate-limit bucket appears to be shared across every client
 your OAuth token (Claude Code CLI, this app, etc.), so polling too aggressively — even
 from a single app — can trip it. Polling cadence adapts instead of staying fixed:
 
+- **Desktop-app cache piggyback:** every automatic poll first checks the Claude desktop
+  app's local cache (`~/Library/Application Support/Claude/plan-usage-history.json`,
+  written every ~15 min whenever that app is running) for a newer sample and updates the
+  5-hour/weekly-all bars from it at zero API cost. The real network fetch — still needed
+  for the weekly-Fable bucket and reset timestamps the cache doesn't carry — then only
+  needs to run hourly while the cache stays fresh.
 - **Fast (5 min):** while "Fast polling (Fable mode)" is checked.
 - **Normal (15 min):** default, whenever the Mac is actively in use.
 - **Idle (30 min):** automatic, once the Mac has been idle 10+ minutes (checked via
@@ -82,9 +88,13 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
   is dead — most such failures turn out to be transient (a flaky refresh call, a
   momentary server hiccup) and clear up within a poll or two. It retries every 90
   seconds, showing "Reconnecting…" with the last-known bars still visible, for up to 20
-  minutes before escalating to the "token expired" setup screen. The 20-minute clock
-  resets on any success, and also resets if a *different* kind of failure (a 429, or a
-  network exception) happens in between — otherwise a stale clock from an
+  minutes before escalating to the "token expired" setup screen. Retries keep running
+  every 90 seconds even after that escalation — the 20-minute grace period only decides
+  which message is shown, not the retry cadence — since a plain retry has consistently
+  cleared these episodes just as well as a real re-login, and there'd otherwise be
+  nothing to auto-heal it once polling backed off to the 15-30 min normal cadence. The
+  clock resets on any success, and also resets if a *different* kind of failure (a 429,
+  or a network exception) happens in between — otherwise a stale clock from an
   already-resolved incident could make a later, unrelated 401 escalate immediately
   instead of getting its own fresh 20 minutes. The 429 backoff multiplier has the same
   reset-on-a-different-failure-type behavior.

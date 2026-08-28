@@ -61,6 +61,24 @@ final class UsageModel: ObservableObject {
     // both trying to refresh the same single-use refresh token, guaranteeing one fails.
     private var isReloading = false
 
+    // The desktop Claude app polls the same usage endpoint every ~15 min whenever it's
+    // running (which is always, for Keith) and writes the results to this local cache.
+    // The endpoint's rate-limit bucket is shared per-token across clients and appears
+    // sized for roughly one — so our own polls stacked on the desktop app's were what
+    // kept tripping 429s. Piggybacking on its cache costs zero API calls; the network
+    // fetch below then only needs to run hourly to fill in what the cache lacks (the
+    // weekly-Fable bucket and reset timestamps).
+    private var lastCacheMTime: Date?
+    private static let desktopCacheURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Claude/plan-usage-history.json")
+    private static let cacheFreshWindow: TimeInterval = 1200      // desktop app writes every ~15 min
+    private static let cacheBackedNetworkInterval: TimeInterval = 3600
+
+    private var cacheIsFresh: Bool {
+        guard let lastCacheMTime else { return false }
+        return Date().timeIntervalSince(lastCacheMTime) < Self.cacheFreshWindow
+    }
+
     // Since this app is the only client that ever refreshes its Keychain credential (Keith
     // doesn't run Claude Code CLI directly), a refresh attempt that starts before the network
     // has actually stabilized post-wake risks the single-use refresh token being rotated
@@ -90,16 +108,24 @@ final class UsageModel: ObservableObject {
 
     /// Most 401s turn out to be transient (a flaky refresh call, a momentary server hiccup) and
     /// clear up on their own — retry quickly and quietly rather than immediately telling the user
-    /// they need to redo the one-time setup. Only escalate to needsLogin once failures persist
-    /// past this grace period.
+    /// they need to redo the one-time setup. The grace period only controls which message is
+    /// shown (`Reconnecting…` vs the full needsLogin screen); polling itself stays at this fast
+    /// interval for as long as the failure is unresolved, even past the grace period. Keith is
+    /// the sole client ever refreshing this Keychain item, and a plain retry — manual or
+    /// automatic — has consistently cleared these episodes just as well as a real re-login would,
+    /// so backing off to the normal 15-30 min cadence here would just mean sitting on the
+    /// needsLogin screen until he happens to click Refresh himself.
     private static let authRetryInterval: TimeInterval = 90
     private static let authRetryGracePeriod: TimeInterval = 1200
 
     private var currentPollInterval: TimeInterval {
-        if let authFailureSince, Date().timeIntervalSince(authFailureSince) < Self.authRetryGracePeriod {
+        if authFailureSince != nil {
             return Self.authRetryInterval
         }
         if fastPollingEnabled { return Self.fastPollInterval }
+        // While the desktop app's cache is feeding the bars, the network fetch only needs
+        // to run hourly (for the Fable bucket and reset timestamps the cache lacks).
+        if cacheIsFresh { return Self.cacheBackedNetworkInterval }
         if Self.systemIdleSeconds() >= Self.idleThreshold { return Self.idlePollInterval }
         return Self.normalPollInterval
     }
@@ -117,7 +143,10 @@ final class UsageModel: ObservableObject {
 
     /// `manual: true` (the Refresh button) bypasses the rate-limit cooldown.
     func refresh(manual: Bool = false) {
-        Task { await reload(manual: manual) }
+        Task {
+            if !manual { await pollDesktopCache() }
+            await reload(manual: manual)
+        }
     }
 
     // MARK: Menu bar label
@@ -192,6 +221,62 @@ final class UsageModel: ObservableObject {
         if now.timeIntervalSince(wokeAt) >= Self.maxWakeNetworkWait { return false }
         guard let networkSatisfiedSince else { return true }
         return now.timeIntervalSince(networkSatisfiedSince) < Self.requiredStableNetworkDuration
+    }
+
+    // MARK: Desktop-cache piggyback
+
+    /// Updates the 5-hour and weekly-all bars from the desktop app's local cache when it has
+    /// a newer sample than our last update. Zero API calls. The cache's `u` dict holds integer
+    /// percentages: `fh` (five-hour) and `sd` (seven-day all-models); it has no Fable bucket
+    /// and no reset timestamps, so those keep whatever the last real network fetch supplied.
+    private func pollDesktopCache() async {
+        let url = Self.desktopCacheURL
+        let previousMTime = lastCacheMTime
+        let result: (mtime: Date, sampleDate: Date, fiveHour: Double?, weekly: Double?)? =
+            await Task.detached {
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                      let mtime = attrs[.modificationDate] as? Date
+                else { return nil }
+                // Only re-parse when the file has actually changed (it's ~0.5MB of history).
+                if let previousMTime, mtime <= previousMTime { return nil }
+                guard let data = try? Data(contentsOf: url),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let samples = object["samples"] as? [[String: Any]],
+                      let last = samples.last,
+                      let t = (last["t"] as? NSNumber)?.doubleValue,
+                      let usage = last["u"] as? [String: Any]
+                else { return nil }
+                return (
+                    mtime,
+                    Date(timeIntervalSince1970: t / 1000),
+                    (usage["fh"] as? NSNumber)?.doubleValue,
+                    (usage["sd"] as? NSNumber)?.doubleValue
+                )
+            }.value
+
+        guard let result else { return }
+        lastCacheMTime = result.mtime
+
+        guard result.sampleDate > (lastUpdated ?? .distantPast), !buckets.isEmpty else { return }
+        buckets = buckets.map { bucket in
+            let percent: Double?
+            switch bucket.key {
+            case "session", "five_hour":  percent = result.fiveHour
+            case "weekly_all", "seven_day": percent = result.weekly
+            default: percent = nil
+            }
+            guard let percent else { return bucket }
+            return UsageBucket(
+                key: bucket.key,
+                title: bucket.title,
+                percent: min(max(percent, 0), 100),
+                resetsAt: bucket.resetsAt
+            )
+        }
+        lastUpdated = result.sampleDate
+        // The bars are current again — clear a lingering rate-limited/error banner. A real
+        // login problem (needsLogin) stays; the cache can't fix authentication.
+        if case .error = status { status = .ok }
     }
 
     // MARK: Core flow
