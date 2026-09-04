@@ -43,6 +43,11 @@ cd ClaudeUsageBar
 swift run
 ```
 
+Note for builds run from inside an Xcode Coding Assistant session: SwiftPM's manifest
+compile hits a sandbox block on the shared clang module cache ("Operation not
+permitted"). Prefix with `CLANG_MODULE_CACHE_PATH="$PWD/.build/module-cache"` to
+redirect it into the project. Plain Terminal builds are unaffected.
+
 The first run triggers a Keychain permission dialog — click **Always Allow**. Then tick
 **Start at login** in the panel and you can close the Terminal for good.
 
@@ -57,12 +62,17 @@ The `api/oauth/usage` rate-limit bucket appears to be shared across every client
 your OAuth token (Claude Code CLI, this app, etc.), so polling too aggressively — even
 from a single app — can trip it. Polling cadence adapts instead of staying fixed:
 
-- **Desktop-app cache piggyback:** every automatic poll first checks the Claude desktop
-  app's local cache (`~/Library/Application Support/Claude/plan-usage-history.json`,
-  written every ~15 min whenever that app is running) for a newer sample and updates the
-  5-hour/weekly-all bars from it at zero API cost. The real network fetch — still needed
-  for the weekly-Fable bucket and reset timestamps the cache doesn't carry — then only
-  needs to run hourly while the cache stays fresh.
+- **Desktop-app cache piggyback:** every poll — automatic or the Refresh button — first
+  checks the Claude desktop app's local cache
+  (`~/Library/Application Support/Claude/plan-usage-history.json`, written every ~15 min
+  whenever that app is running) for a newer sample and updates the 5-hour/weekly-all
+  bars from it at zero API cost. The real network fetch — still needed for the
+  weekly-Fable bucket and reset timestamps the cache doesn't carry — then only needs to
+  run hourly while the cache stays fresh. When the panel has no bars at all (the app
+  relaunched into a rate-limit episode and has never had a successful fetch), the cache
+  *seeds* the two bars it does carry, provided its sample is under an hour old —
+  previously the empty panel just showed a bare error for the whole cooldown while
+  fresh cache data was discarded every tick.
 - **Fast (5 min):** while "Fast polling (Fable mode)" is checked.
 - **Normal (15 min):** default, whenever the Mac is actively in use.
 - **Idle (30 min):** automatic, once the Mac has been idle 10+ minutes (checked via
@@ -82,6 +92,10 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
   wait on each consecutive 429 (capped at 16×) so one hiccup can't cascade into a
   multi-hour lockout from retrying at full speed the moment each cooldown expires. The
   backoff resets on the next success. Shows "Rate limited — retrying at …" meanwhile.
+  Only *automatic* polls escalate the multiplier: manual Refresh clicks bypass the
+  cooldown and so are near-certain to re-429 mid-episode, and each click was re-doubling
+  the wait — pushing the retry time out to the 4-hour cap precisely because the user
+  kept asking it to try again (fixed 2026-09-04).
 - OAuth token refreshes are attempted at most once per 10 minutes (except the fast
   auth-failure retry below, which isn't subject to this).
 - On a 401 whose refresh attempt fails, the app doesn't immediately assume the token
@@ -101,6 +115,14 @@ from a single app — can trip it. Polling cadence adapts instead of staying fix
 - Refresh (the button) always bypasses every throttle above, but never runs concurrently
   with an already-in-flight reload (automatic or manual) — otherwise both could read and
   try to refresh the same single-use refresh token, guaranteeing one of them fails.
+
+## Diagnostics
+
+Every failure (429 with its `retry-after` header and backoff state, 401 with failed
+refresh, other HTTP errors, network exceptions), plus recoveries and cache seeds, is
+appended to `~/Library/Logs/ClaudeUsageBar.log` — the panel only ever shows the latest
+state, so recurring episodes (like the repeated-429 mornings) were undiagnosable after
+the fact. The file starts over past ~512KB. Check it before theorizing about a failure.
 
 ## Notes / caveats
 

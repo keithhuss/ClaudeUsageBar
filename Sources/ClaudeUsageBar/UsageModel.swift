@@ -73,6 +73,7 @@ final class UsageModel: ObservableObject {
         .appendingPathComponent("Library/Application Support/Claude/plan-usage-history.json")
     private static let cacheFreshWindow: TimeInterval = 1200      // desktop app writes every ~15 min
     private static let cacheBackedNetworkInterval: TimeInterval = 3600
+    private static let seedMaxSampleAge: TimeInterval = 3600      // don't seed bars from stale data
 
     private var cacheIsFresh: Bool {
         guard let lastCacheMTime else { return false }
@@ -144,7 +145,7 @@ final class UsageModel: ObservableObject {
     /// `manual: true` (the Refresh button) bypasses the rate-limit cooldown.
     func refresh(manual: Bool = false) {
         Task {
-            if !manual { await pollDesktopCache() }
+            await pollDesktopCache()
             await reload(manual: manual)
         }
     }
@@ -257,26 +258,52 @@ final class UsageModel: ObservableObject {
         guard let result else { return }
         lastCacheMTime = result.mtime
 
-        guard result.sampleDate > (lastUpdated ?? .distantPast), !buckets.isEmpty else { return }
-        buckets = buckets.map { bucket in
-            let percent: Double?
-            switch bucket.key {
-            case "session", "five_hour":  percent = result.fiveHour
-            case "weekly_all", "seven_day": percent = result.weekly
-            default: percent = nil
+        guard result.sampleDate > (lastUpdated ?? .distantPast) else { return }
+
+        if buckets.isEmpty {
+            // Seed the bars outright when there's nothing to update — e.g. the app relaunched
+            // straight into a rate-limit cooldown, where the network path can stay blocked for
+            // hours. Previously the empty-buckets case just returned here, so the panel showed
+            // a bare error for the entire cooldown while fresh cache data was discarded every
+            // tick. Reset times aren't in the cache; they arrive with the next real fetch.
+            guard Date().timeIntervalSince(result.sampleDate) < Self.seedMaxSampleAge else { return }
+            var seeded: [UsageBucket] = []
+            if let fiveHour = result.fiveHour {
+                seeded.append(UsageBucket(key: "session", title: "5-hour limit",
+                                          percent: min(max(fiveHour, 0), 100), resetsAt: nil))
             }
-            guard let percent else { return bucket }
-            return UsageBucket(
-                key: bucket.key,
-                title: bucket.title,
-                percent: min(max(percent, 0), 100),
-                resetsAt: bucket.resetsAt
-            )
+            if let weekly = result.weekly {
+                seeded.append(UsageBucket(key: "weekly_all", title: "Weekly · all models",
+                                          percent: min(max(weekly, 0), 100), resetsAt: nil))
+            }
+            guard !seeded.isEmpty else { return }
+            buckets = seeded
+            Self.log("seeded bars from desktop cache (sample \(result.sampleDate.formatted()))")
+        } else {
+            buckets = buckets.map { bucket in
+                let percent: Double?
+                switch bucket.key {
+                case "session", "five_hour":  percent = result.fiveHour
+                case "weekly_all", "seven_day": percent = result.weekly
+                default: percent = nil
+                }
+                guard let percent else { return bucket }
+                return UsageBucket(
+                    key: bucket.key,
+                    title: bucket.title,
+                    percent: min(max(percent, 0), 100),
+                    resetsAt: bucket.resetsAt
+                )
+            }
         }
         lastUpdated = result.sampleDate
-        // The bars are current again — clear a lingering rate-limited/error banner. A real
-        // login problem (needsLogin) stays; the cache can't fix authentication.
-        if case .error = status { status = .ok }
+        // The bars are current again — clear the initial loading spinner or a lingering
+        // rate-limited/error banner (either would hide or overshadow them). A real login
+        // problem (needsLogin) stays; the cache can't fix authentication.
+        switch status {
+        case .loading, .error: status = .ok
+        case .ok, .needsLogin: break
+        }
     }
 
     // MARK: Core flow
@@ -350,6 +377,7 @@ final class UsageModel: ObservableObject {
                     consecutive429s = 0
                     let failingSince = authFailureSince ?? Date()
                     authFailureSince = failingSince
+                    Self.log("401, refresh failed (failing since \(failingSince.formatted()))")
                     if Date().timeIntervalSince(failingSince) < Self.authRetryGracePeriod {
                         status = .error("Reconnecting…")
                     } else {
@@ -358,17 +386,23 @@ final class UsageModel: ObservableObject {
                 } else if code == 429 {
                     // Back off harder on repeated 429s — resuming at full cadence right when a
                     // single cooldown expires can retrigger the limit if its window hasn't really
-                    // cleared, turning one hiccup into a cascading multi-hour lockout.
+                    // cleared, turning one hiccup into a cascading multi-hour lockout. Only
+                    // automatic polls escalate the multiplier, though: manual Refresh clicks
+                    // bypass the cooldown, so during an episode each hopeful click was re-429ing
+                    // and re-doubling the wait — user-visible as the retry time leaping hours
+                    // into the future precisely because they asked it to try again.
                     authFailureSince = nil
-                    consecutive429s += 1
+                    if !manual { consecutive429s += 1 }
                     let base = max(retryAfter ?? 900, 300)
-                    let wait = base * pow(2.0, Double(min(consecutive429s - 1, 4)))
+                    let wait = base * pow(2.0, Double(min(max(consecutive429s, 1) - 1, 4)))
                     let until = Date().addingTimeInterval(wait)
                     cooldownUntil = until
+                    Self.log("429 (manual: \(manual), retry-after: \(retryAfter.map { String(Int($0)) } ?? "none"), consecutive: \(consecutive429s)) — cooldown until \(until.formatted())")
                     status = .error("Rate limited — retrying at \(until.formatted(date: .omitted, time: .shortened))")
                 } else {
                     authFailureSince = nil
                     consecutive429s = 0
+                    Self.log("HTTP \(code): \(Self.apiErrorMessage(from: data) ?? "no error message")")
                     status = .error(Self.apiErrorMessage(from: data) ?? "HTTP \(code)")
                 }
                 return
@@ -378,6 +412,7 @@ final class UsageModel: ObservableObject {
                 status = .error("Unexpected response format from the usage endpoint.")
                 return
             }
+            if cooldownUntil != nil || authFailureSince != nil { Self.log("recovered — 200 OK") }
             cooldownUntil = nil
             consecutive429s = 0
             authFailureSince = nil
@@ -387,6 +422,7 @@ final class UsageModel: ObservableObject {
         } catch {
             authFailureSince = nil
             consecutive429s = 0
+            Self.log("network error: \(error.localizedDescription)")
             status = .error(error.localizedDescription)
         }
     }
@@ -394,6 +430,29 @@ final class UsageModel: ObservableObject {
     private func mayAttemptTokenRefresh() -> Bool {
         guard let last = lastTokenRefreshAttempt else { return true }
         return Date().timeIntervalSince(last) > 600
+    }
+
+    // MARK: Diagnostics
+
+    /// Appends one line to ~/Library/Logs/ClaudeUsageBar.log — the panel only ever shows the
+    /// latest state, so recurring failures (like the repeated-429 mornings) have been
+    /// undiagnosable after the fact. Starts over past ~512KB rather than rotating.
+    nonisolated private static func log(_ message: String) {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/ClaudeUsageBar.log")
+        let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false).timeZone(separator: .omitted))
+        guard let data = "\(stamp) \(message)\n".data(using: .utf8) else { return }
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int,
+           size > 512_000 {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
     }
 
     // MARK: Networking
