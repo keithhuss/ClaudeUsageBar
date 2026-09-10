@@ -9,7 +9,12 @@ panel with all the bars, reset times, and controls:
 
 - **Window button (header):** shows/hides an optional floating window with the same
   bars — always on top (even over Xcode), draggable, remembers its position. Closing
-  the window keeps the app running; clicking the Dock icon reopens it.
+  the window keeps the app running; clicking the Dock icon reopens it. The bars stay
+  in color when the window is inactive: the window's root view overrides both
+  `controlActiveState` *and* `appearsActive` (macOS 15 moved accent-color desaturation
+  to the latter, which silently un-fixed the original override — re-fixed 2026-09-09),
+  and the bar fill uses `NSColor.controlAccentColor` rather than SwiftUI's
+  `.accentColor`, which desaturates to grey in inactive windows regardless.
 - **Refresh:** immediate fetch (bypasses the rate-limit cooldown and the poll-interval throttle).
 - **Fast polling (Fable mode):** tick the box before a Fable session to poll every 5
   minutes instead of the normal cadence; untick when done.

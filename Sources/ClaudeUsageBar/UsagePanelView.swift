@@ -114,7 +114,9 @@ struct UsagePanelView: View {
     private func tint(for percent: Double) -> Color {
         if percent >= 90 { return .red }
         if percent >= 70 { return .orange }
-        return .accentColor
+        // Not .accentColor — SwiftUI desaturates it to grey in inactive windows;
+        // the NSColor resolves to the user's accent color regardless of key state.
+        return Color(nsColor: .controlAccentColor)
     }
 
     private func resetText(_ date: Date?) -> String {

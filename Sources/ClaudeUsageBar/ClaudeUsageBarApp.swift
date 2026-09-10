@@ -67,8 +67,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Obse
     }
 
     private func makeWindow() -> NSWindow {
+        // Keep the panel fully colored when the window is inactive. macOS 15 moved
+        // active-state desaturation from controlActiveState to appearsActive, so
+        // both must be overridden.
         let hosting = NSHostingController(rootView: UsagePanelView(model: Self.model, appDelegate: self, isFloating: true)
-            .environment(\.controlActiveState, .active))
+            .environment(\.controlActiveState, .active)
+            .environment(\.appearsActive, true))
         let window = NSWindow(contentViewController: hosting)
         window.title = "Claude Usage"
         window.styleMask = [.titled, .closable, .miniaturizable]
