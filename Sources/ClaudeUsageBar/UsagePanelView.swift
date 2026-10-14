@@ -7,8 +7,18 @@ struct UsagePanelView: View {
     var isFloating: Bool = false
     @State private var startAtLogin = LoginItemManager.isEnabled
 
+    // The floating window renders at ~75% of the menu-bar panel: narrower,
+    // tighter spacing, smaller type and controls. The panel itself is unchanged.
+    private var panelWidth: CGFloat { isFloating ? 210 : 280 }
+    private var outerPadding: CGFloat { isFloating ? 10 : 14 }
+    private var rowSpacing: CGFloat { isFloating ? 9 : 12 }
+    private var barHeight: CGFloat { isFloating ? 3 : 4 }
+    private var bodyFont: Font { isFloating ? .system(size: 9) : .callout }
+    private var detailFont: Font { isFloating ? .system(size: 8) : .caption }
+    private var buttonSize: ControlSize { isFloating ? .mini : .small }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: rowSpacing) {
             if !isFloating {
                 HStack {
                     Text("Claude Usage")
@@ -37,7 +47,7 @@ struct UsagePanelView: View {
             case .error(let message):
                 Label(message, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
-                    .font(.callout)
+                    .font(bodyFont)
                 if !model.buckets.isEmpty {
                     bucketRows
                 }
@@ -51,14 +61,14 @@ struct UsagePanelView: View {
             HStack {
                 if let updated = model.lastUpdated {
                     Text("Updated \(updated.formatted(date: .omitted, time: .shortened))")
-                        .font(.caption)
+                        .font(detailFont)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Refresh") { model.refresh(manual: true) }
-                    .controlSize(.small)
+                    .controlSize(buttonSize)
                 Button("Quit") { NSApplication.shared.terminate(nil) }
-                    .controlSize(.small)
+                    .controlSize(buttonSize)
             }
 
             if !isFloating {
@@ -83,29 +93,29 @@ struct UsagePanelView: View {
                     }
             }
         }
-        .padding(14)
-        .frame(width: 280)
+        .padding(outerPadding)
+        .frame(width: panelWidth)
         .onAppear { model.refresh() }
     }
 
     private var bucketRows: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: rowSpacing) {
             ForEach(model.buckets) { bucket in
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: isFloating ? 3 : 4) {
                     HStack(alignment: .firstTextBaseline) {
                         Text(bucket.title)
-                            .font(.callout)
+                            .font(bodyFont)
                         Spacer()
                         Text(resetText(bucket.resetsAt))
-                            .font(.caption)
+                            .font(detailFont)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                         Text("\(Int(bucket.percent.rounded()))%")
-                            .font(.callout.monospacedDigit())
+                            .font(bodyFont.monospacedDigit())
                             .foregroundStyle(bucket.percent >= 90 ? .red : .primary)
                             .layoutPriority(1)
                     }
-                    UsageProgressBar(percent: bucket.percent, color: tint(for: bucket.percent))
+                    UsageProgressBar(percent: bucket.percent, color: tint(for: bucket.percent), height: barHeight)
                 }
             }
         }
@@ -114,9 +124,21 @@ struct UsagePanelView: View {
     private func tint(for percent: Double) -> Color {
         if percent >= 90 { return .red }
         if percent >= 70 { return .orange }
-        // Not .accentColor — SwiftUI desaturates it to grey in inactive windows;
-        // the NSColor resolves to the user's accent color regardless of key state.
-        return Color(nsColor: .controlAccentColor)
+        // Not .accentColor, and not Color(nsColor: .controlAccentColor) either —
+        // both are dynamic colors that SwiftUI desaturates to grey in inactive
+        // windows (the NSColor path started doing so on macOS 27). Resolve the
+        // accent to plain sRGB components each render instead: a concrete color
+        // has no key-state dependency for any future mechanism to hook into.
+        return Self.concreteAccentColor
+    }
+
+    /// The user's accent color as a fixed RGB value, re-read on every call so a
+    /// change in System Settings still shows up on the next redraw.
+    private static var concreteAccentColor: Color {
+        guard let rgb = NSColor.controlAccentColor.usingColorSpace(.sRGB) else {
+            return .blue
+        }
+        return Color(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent)
     }
 
     private func resetText(_ date: Date?) -> String {
@@ -137,6 +159,7 @@ struct UsagePanelView: View {
     private struct UsageProgressBar: View {
         let percent: Double
         let color: Color
+        var height: CGFloat = 4
 
         var body: some View {
             GeometryReader { geo in
@@ -148,7 +171,7 @@ struct UsagePanelView: View {
                         .frame(width: geo.size.width * min(percent / 100, 1))
                 }
             }
-            .frame(height: 4)
+            .frame(height: height)
         }
     }
 

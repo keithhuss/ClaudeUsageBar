@@ -97,6 +97,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Obse
         }
         window.setFrameAutosaveName("ClaudeUsageWindow")
 
+        // A restored frame carries the size from the previous build; re-fit the
+        // content size, keeping the window's top-left corner where it was.
+        let fitted = hosting.view.fittingSize
+        if window.contentRect(forFrameRect: window.frame).size != fitted {
+            let topLeft = NSPoint(x: window.frame.minX, y: window.frame.maxY)
+            window.setContentSize(fitted)
+            window.setFrameTopLeftPoint(topLeft)
+        }
+
         // Clamp fully on-screen — also heals a bad frame saved by earlier builds.
         if let screen = NSScreen.main {
             let visible = screen.visibleFrame

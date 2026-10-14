@@ -9,12 +9,15 @@ panel with all the bars, reset times, and controls:
 
 - **Window button (header):** shows/hides an optional floating window with the same
   bars — always on top (even over Xcode), draggable, remembers its position. Closing
-  the window keeps the app running; clicking the Dock icon reopens it. The bars stay
+  the window keeps the app running; clicking the Dock icon reopens it. It renders at
+  ~75% of the panel (210pt wide, 9/8pt type, mini buttons — 2026-10-13). The bars stay
   in color when the window is inactive: the window's root view overrides both
   `controlActiveState` *and* `appearsActive` (macOS 15 moved accent-color desaturation
   to the latter, which silently un-fixed the original override — re-fixed 2026-09-09),
-  and the bar fill uses `NSColor.controlAccentColor` rather than SwiftUI's
-  `.accentColor`, which desaturates to grey in inactive windows regardless.
+  and the bar fill is a *concrete* RGB color resolved from `NSColor.controlAccentColor`
+  on each render — macOS 27 started desaturating even the `Color(nsColor:)` wrapper in
+  inactive windows (re-fixed again 2026-10-13); only a plain RGB value has no
+  key-state dependency left to break.
 - **Refresh:** immediate fetch (bypasses the rate-limit cooldown and the poll-interval throttle).
 - **Fast polling (Fable mode):** tick the box before a Fable session to poll every 5
   minutes instead of the normal cadence; untick when done.
