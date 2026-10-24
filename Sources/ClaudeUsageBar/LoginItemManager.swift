@@ -36,6 +36,24 @@ enum LoginItemManager {
         FileManager.default.fileExists(atPath: agentPlistURL.path)
     }
 
+    /// Rewrites the LaunchAgent if it points anywhere other than this bundle's
+    /// executable. The agent written by an early unbundled build pointed at a
+    /// private copy under Application Support, so every login relaunched a
+    /// months-old binary (found 2026-10-24: a July build with none of the later
+    /// fixes). Running from the proper .app is the only time we know the right
+    /// path, so that is when it gets corrected.
+    static func repairIfStale() {
+        guard isRunningBundled, isEnabled,
+              let data = try? Data(contentsOf: agentPlistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let args = plist["ProgramArguments"] as? [String]
+        else { return }
+        if args.first != launchBinaryURL.path {
+            enable()
+            try? FileManager.default.removeItem(at: installedBinaryURL)
+        }
+    }
+
     /// Returns false if installation failed (toggle should revert).
     @discardableResult
     static func enable() -> Bool {

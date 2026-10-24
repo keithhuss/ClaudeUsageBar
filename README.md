@@ -22,11 +22,13 @@ panel with all the bars, reset times, and controls:
 - **Fast polling (Fable mode):** tick the box before a Fable session to poll every 5
   minutes instead of the normal cadence; untick when done.
 - **Quit:** the only way the app exits.
-- **Start at login:** installs a LaunchAgent (`com.keith.ClaudeUsageBar`) that runs a
-  copy of the binary from `~/Library/Application Support/ClaudeUsageBar/` at every
-  login. Untick to remove both. Note: after rebuilding the app, untick/re-tick once to
-  refresh the installed copy; the login copy triggers one new Keychain prompt on first
-  run (click Always Allow).
+- **Start at login:** installs a LaunchAgent (`com.keith.ClaudeUsageBar`) that launches
+  `/Applications/ClaudeUsageBar.app` at every login. Untick to remove it. Early
+  unbundled builds instead pointed the agent at a private binary copy under
+  `~/Library/Application Support/ClaudeUsageBar/`, and that agent silently relaunched a
+  July build at every reboot for months (found 2026-10-24). Both the app at launch and
+  `install.sh` now rewrite a stale agent to the bundle path and delete the old copy, so
+  no untick/re-tick dance is needed after rebuilding.
 
 ## One-time setup
 

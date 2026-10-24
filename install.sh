@@ -64,6 +64,18 @@ printf '<?xml version="1.0" encoding="UTF-8"?>
 # Strip quarantine so macOS does not block the first launch.
 xattr -cr "$APP_BUNDLE" 2>/dev/null || true
 
+# If Start-at-login is enabled, make sure the agent launches THIS bundle.
+# An agent written by an early unbundled build pointed at a private copy in
+# Application Support and kept relaunching a months-old binary at every login.
+AGENT_PLIST="$HOME/Library/LaunchAgents/${BUNDLE_ID}.plist"
+STALE_COPY="$HOME/Library/Application Support/${APP_NAME}/${APP_NAME}"
+if [[ -f "$AGENT_PLIST" ]]; then
+    echo "==> Pointing Start-at-login agent at ${APP_BUNDLE}..."
+    launchctl bootout "gui/$(id -u)/${BUNDLE_ID}" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 ${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" "$AGENT_PLIST"
+    rm -f "$STALE_COPY"
+fi
+
 echo "==> Launching ${APP_NAME}..."
 open "$APP_BUNDLE"
 

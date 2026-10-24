@@ -44,6 +44,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Obse
         if Bundle.main.bundleIdentifier == nil {
             NSApp.setActivationPolicy(.regular)
         }
+        // A Start-at-login agent left over from an unbundled build would
+        // relaunch a stale binary at every login; point it at this bundle.
+        LoginItemManager.repairIfStale()
         // The floating window is opt-in — open it from the menu-bar panel.
     }
 
